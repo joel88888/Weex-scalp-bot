@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weex-scalp"
+version = "0.1.0"
+description = "Beginner WEEX BTCUSDT perpetual scalping scaffold (demo / dry-run first)."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Joel Burpitt" }]
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=12.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+weex-scalp = "weex_scalp.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["weex_scalp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
