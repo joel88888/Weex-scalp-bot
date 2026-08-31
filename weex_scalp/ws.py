@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
@@ -223,6 +224,39 @@ class QuoteFeed:
         return None
 
 
+class QuoteStallWatchdog:
+    """Trip when no usable (has_book) quote arrives within timeout seconds.
+
+    Ticker-only last prices are not usable for entries, so they do not reset
+    the timer. timeout_seconds <= 0 disables the watchdog.
+    """
+
+    def __init__(
+        self,
+        timeout_seconds: float,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        self.timeout_seconds = timeout_seconds
+        self._clock = clock or time.monotonic
+        self._last = self._clock()
+
+    def reset(self) -> None:
+        self._last = self._clock()
+
+    def mark(self, quote: Quote | None = None) -> None:
+        if quote is not None and not quote.has_book:
+            return
+        self._last = self._clock()
+
+    def silent_for(self) -> float:
+        return self._clock() - self._last
+
+    def stalled(self) -> bool:
+        if self.timeout_seconds <= 0:
+            return False
+        return self.silent_for() >= self.timeout_seconds
+
+
 class PublicWsFeed(QuoteFeed):
     def __init__(
         self,
@@ -231,12 +265,21 @@ class PublicWsFeed(QuoteFeed):
         user_agent: str = USER_AGENT,
         on_disconnect: Callable[[], None] | None = None,
         seed: Quote | None = None,
+        stall_timeout_seconds: float = 90.0,
+        reconnect_delay_seconds: float = 2.0,
+        clock: Callable[[], float] | None = None,
+        connect: Callable[..., Any] | None = None,
     ) -> None:
         self.url = url
         self.symbol = symbol.upper()
         self.user_agent = user_agent
+        # Kept for callers; stall/disconnect now reconnect instead of halt.
         self.on_disconnect = on_disconnect
         self.seed = seed
+        self.stall_timeout_seconds = stall_timeout_seconds
+        self.reconnect_delay_seconds = reconnect_delay_seconds
+        self._clock = clock or time.monotonic
+        self._connect = connect
         self._stop = asyncio.Event()
         self.book = LocalBook()
         if seed is not None:
@@ -245,54 +288,107 @@ class PublicWsFeed(QuoteFeed):
     def stop(self) -> None:
         self._stop.set()
 
+    def _recv_poll_seconds(self) -> float:
+        stall = self.stall_timeout_seconds
+        if stall <= 0:
+            return 1.0
+        return min(1.0, stall)
+
     async def quotes(self) -> AsyncIterator[Quote]:
         import websockets
         from websockets.exceptions import ConnectionClosed
 
+        connect = self._connect or websockets.connect
         headers = {"User-Agent": self.user_agent}
-        log.info("ws_connect url=%s ua=%s", self.url, self.user_agent)
+        watchdog = QuoteStallWatchdog(self.stall_timeout_seconds, clock=self._clock)
         if self.seed is not None:
+            watchdog.mark(self.seed)
             yield self.seed
-        try:
-            async with websockets.connect(
-                self.url,
-                additional_headers=headers,
-                ping_interval=None,
-                open_timeout=15,
-                close_timeout=5,
-            ) as ws:
-                sub = subscribe_message(self.symbol)
-                await ws.send(json.dumps(sub, separators=(",", ":")))
-                log.info("ws_subscribed %s", sub["params"])
-                while not self._stop.is_set():
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                    except TimeoutError:
-                        continue
-                    if isinstance(raw, bytes):
-                        raw = raw.decode("utf-8")
-                    try:
-                        message = json.loads(raw)
-                    except json.JSONDecodeError:
-                        log.warning("ws_non_json %s", raw[:200])
-                        continue
-                    if not isinstance(message, dict):
-                        continue
-                    if is_ping(message):
-                        await ws.send(json.dumps(PONG, separators=(",", ":")))
-                        continue
-                    quote = self.book.apply(message)
-                    if quote is not None:
-                        yield quote
-        except ConnectionClosed:
-            log.error("ws_disconnected")
-            if self.on_disconnect:
-                self.on_disconnect()
-        except Exception:
-            log.exception("ws_error")
-            if self.on_disconnect:
-                self.on_disconnect()
-            raise
+
+        attempt = 0
+        while not self._stop.is_set():
+            attempt += 1
+            stalled = False
+            log.info("ws_connect url=%s ua=%s attempt=%s", self.url, self.user_agent, attempt)
+            try:
+                async with connect(
+                    self.url,
+                    additional_headers=headers,
+                    ping_interval=None,
+                    open_timeout=15,
+                    close_timeout=5,
+                ) as ws:
+                    watchdog.reset()
+                    sub = subscribe_message(self.symbol)
+                    await ws.send(json.dumps(sub, separators=(",", ":")))
+                    log.info("ws_subscribed %s", sub["params"])
+                    while not self._stop.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=self._recv_poll_seconds())
+                        except TimeoutError:
+                            if watchdog.stalled():
+                                log.warning(
+                                    "ws_stall no usable quote for %.0fs "
+                                    "(timeout=%.0fs); closing public WS to reconnect",
+                                    watchdog.silent_for(),
+                                    self.stall_timeout_seconds,
+                                )
+                                stalled = True
+                                break
+                            continue
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8")
+                        try:
+                            message = json.loads(raw)
+                        except json.JSONDecodeError:
+                            log.warning("ws_non_json %s", raw[:200])
+                            continue
+                        if not isinstance(message, dict):
+                            continue
+                        if is_ping(message):
+                            await ws.send(json.dumps(PONG, separators=(",", ":")))
+                            continue
+                        quote = self.book.apply(message)
+                        if quote is not None:
+                            watchdog.mark(quote)
+                            yield quote
+                            if watchdog.stalled():
+                                # Bookless ticker can keep arriving while depth is dead.
+                                log.warning(
+                                    "ws_stall no usable book quote for %.0fs "
+                                    "(timeout=%.0fs); closing public WS to reconnect",
+                                    watchdog.silent_for(),
+                                    self.stall_timeout_seconds,
+                                )
+                                stalled = True
+                                break
+            except ConnectionClosed:
+                log.warning("ws_disconnected attempt=%s; will reconnect (not halting)", attempt)
+            except (OSError, TimeoutError) as exc:
+                log.warning(
+                    "ws_connect_failed attempt=%s err=%s; will reconnect (not halting)",
+                    attempt,
+                    exc,
+                )
+            except Exception:
+                log.exception("ws_error attempt=%s", attempt)
+                if self.on_disconnect:
+                    self.on_disconnect()
+                raise
+
+            if self._stop.is_set():
+                return
+            delay = max(0.0, self.reconnect_delay_seconds)
+            if stalled:
+                log.info("ws_reconnect after stall delay=%.1fs", delay)
+            else:
+                log.info("ws_reconnect delay=%.1fs", delay)
+            if delay:
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                    return
+                except TimeoutError:
+                    pass
 
 
 class FixtureFeed(QuoteFeed):

@@ -34,6 +34,9 @@ class RiskEngine:
         self.daily_pnl = 0.0
         self._order_times: deque[float] = deque()
         self._cooldown_until = 0.0
+        self._circuit_until = 0.0
+        self._stop_times: deque[float] = deque()
+        self._consecutive_stops = 0
         self.day_key = _london_day_key(settings.timezone)
 
     def snapshot(self, position: Position | None) -> RiskSnapshot:
@@ -57,9 +60,38 @@ class RiskEngine:
             raise Halted(self.halt_reason)
 
     def on_stop_hit(self, now: float | None = None) -> None:
-        until = (now or time.time()) + self.settings.cooldown_after_stop_seconds
+        now = now or time.time()
+        until = now + self.settings.cooldown_after_stop_seconds
         self._cooldown_until = max(self._cooldown_until, until)
-        log.info("cooldown_until=%.0f after stop", self._cooldown_until)
+        self._consecutive_stops += 1
+        self._stop_times.append(now)
+        window = self.settings.stop_circuit_window_seconds
+        cutoff = now - window
+        while self._stop_times and self._stop_times[0] < cutoff:
+            self._stop_times.popleft()
+        log.info(
+            "cooldown_until=%.0f after stop consecutive=%s windowed=%s",
+            self._cooldown_until,
+            self._consecutive_stops,
+            len(self._stop_times),
+        )
+        n = self.settings.stop_circuit_after
+        if n > 0 and self._consecutive_stops >= n and len(self._stop_times) >= n:
+            pause = self.settings.stop_circuit_pause_seconds
+            self._circuit_until = max(self._circuit_until, now + pause)
+            log.warning(
+                "stop_circuit_breaker after %s consecutive stops in %.0fs; "
+                "pausing entries %.0fs until=%.0f",
+                n,
+                window,
+                pause,
+                self._circuit_until,
+            )
+            self._consecutive_stops = 0
+            self._stop_times.clear()
+
+    def on_take_profit(self) -> None:
+        self._consecutive_stops = 0
 
     def record_realized_pnl(self, pnl: float) -> None:
         self._roll_day_if_needed()
@@ -79,8 +111,13 @@ class RiskEngine:
         if position is not None:
             return "max 1 open position"
         now = time.time()
+        if now < self._circuit_until:
+            return f"stop_circuit {self._circuit_until - now:.0f}s remaining"
         if now < self._cooldown_until:
             return f"cooldown {self._cooldown_until - now:.0f}s remaining"
+        fee_reject = _fee_aware_tp_reject(self.settings)
+        if fee_reject:
+            return fee_reject
         if intent.qty <= 0:
             return "qty must be > 0"
         if intent.qty - self.settings.max_position_qty > 1e-12:
@@ -136,3 +173,14 @@ def _london_day_key(timezone: str) -> str:
     except Exception:
         tz = ZoneInfo("Europe/London")
     return datetime.now(tz).date().isoformat()
+
+
+def _fee_aware_tp_reject(settings: Settings) -> str | None:
+    if settings.take_profit_covers_fees():
+        return None
+    round_trip_pct = settings.round_trip_taker_fee * 100.0
+    buffer_pct = settings.tp_fee_buffer * 100.0
+    return (
+        f"take_profit {settings.take_profit_pct:g}% cannot cover "
+        f"round-trip taker fees {round_trip_pct:g}% + buffer {buffer_pct:g}%"
+    )

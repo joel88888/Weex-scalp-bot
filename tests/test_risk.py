@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from weex_scalp.execution import DryRunBroker, apply_fill, realized_pnl
 from weex_scalp.models import OrderIntent, Position, PositionSide, Quote, Side, Signal
 from weex_scalp.risk import RiskEngine
@@ -72,6 +74,84 @@ def test_cooldown_after_stop(settings):
     reject = risk.allow_entry(_intent(), _quote(), None)
     assert reject is not None
     assert "cooldown" in reject
+
+
+def test_fee_aware_tp_skips_when_tp_cannot_cover_round_trip_fees(settings):
+    tight = replace(settings, take_profit_pct=0.12, taker_fee_rate=0.0006, tp_fee_buffer=0.0002)
+    assert tight.take_profit_covers_fees() is False
+    risk = RiskEngine(tight)
+    reject = risk.allow_entry(_intent(), _quote(), None)
+    assert reject is not None
+    assert "cannot cover" in reject
+    assert "take_profit" in reject
+
+
+def test_fee_aware_tp_allows_when_default_tp_has_buffer(settings):
+    assert settings.take_profit_pct == 0.20
+    assert settings.take_profit_covers_fees() is True
+    risk = RiskEngine(settings)
+    assert risk.allow_entry(_intent(), _quote(), None) is None
+
+
+def test_stop_circuit_breaker_after_three_consecutive_stops(settings, monkeypatch):
+    now = [1_000_000.0]
+    monkeypatch.setattr("weex_scalp.risk.time.time", lambda: now[0])
+    s = replace(
+        settings,
+        cooldown_after_stop_seconds=5.0,
+        stop_circuit_after=3,
+        stop_circuit_window_seconds=1800.0,
+        stop_circuit_pause_seconds=900.0,
+    )
+    risk = RiskEngine(s)
+    risk.on_stop_hit()
+    risk.on_stop_hit()
+    now[0] += 6.0
+    assert risk.allow_entry(_intent(), _quote(), None) is None
+    risk.on_stop_hit()
+    reject = risk.allow_entry(_intent(), _quote(), None)
+    assert reject is not None
+    assert "stop_circuit" in reject
+    now[0] += 899.0
+    assert "stop_circuit" in (risk.allow_entry(_intent(), _quote(), None) or "")
+    now[0] += 2.0
+    assert risk.allow_entry(_intent(), _quote(), None) is None
+
+
+def test_take_profit_resets_consecutive_stop_streak(settings, monkeypatch):
+    now = [1.0]
+    monkeypatch.setattr("weex_scalp.risk.time.time", lambda: now[0])
+    s = replace(
+        settings,
+        cooldown_after_stop_seconds=0.0,
+        stop_circuit_after=3,
+        stop_circuit_window_seconds=1800.0,
+        stop_circuit_pause_seconds=900.0,
+    )
+    risk = RiskEngine(s)
+    risk.on_stop_hit()
+    risk.on_stop_hit()
+    risk.on_take_profit()
+    risk.on_stop_hit()
+    assert risk.allow_entry(_intent(), _quote(), None) is None
+
+
+def test_stops_outside_window_do_not_trip_circuit(settings, monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr("weex_scalp.risk.time.time", lambda: now[0])
+    s = replace(
+        settings,
+        cooldown_after_stop_seconds=0.0,
+        stop_circuit_after=3,
+        stop_circuit_window_seconds=60.0,
+        stop_circuit_pause_seconds=900.0,
+    )
+    risk = RiskEngine(s)
+    risk.on_stop_hit()
+    now[0] = 100.0
+    risk.on_stop_hit()
+    risk.on_stop_hit()
+    assert risk.allow_entry(_intent(), _quote(), None) is None
 
 
 def test_realized_pnl_includes_taker_fees(settings):
