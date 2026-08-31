@@ -22,7 +22,7 @@ Demo uses the same API key as live. With `LIVE=false` (the default) the bot stil
 
 ## Honest warning
 
-- Scalping a 0.12% target against a ~0.06% taker fee each way often loses before the market does anything clever.
+- Scalping a 0.20% target against a ~0.06% taker fee each way still has a thin net edge; 0.12% TP (the old default) was eaten entirely by round-trip fees.
 - Demo fills are exchange paper trades. Dry-run fills are the top of the public book. Neither models queue position, partials, or a thin book walking through your size.
 - Demo PnL is not a live forecast.
 - Crypto futures can go to zero. You can lose more than you expect if you later raise size or turn live on. This bot will not protect you from a bad decision to go live.
@@ -129,6 +129,8 @@ Stdout and `logs/bot.log` share the same lines. Useful fields:
 | `fill_px=` | Confirmed fill price. `0` means “accepted, not confirmed yet” — **we do not invent a fill** |
 | `pnl=` | Realized PnL after fees on a close |
 | `HALT` | Risk engine stopped the bot |
+| `ws_stall` | No usable book quote for `QUOTE_STALL_SECONDS`; feed closes and reconnects |
+| `stop_circuit_breaker` | Too many consecutive stops; entries paused |
 
 `logs/trades.csv` is one row per fill or flatten: timestamp (Europe/London), mode, signal, side, qty, price, fee, pnl, order ids.
 
@@ -138,8 +140,8 @@ Stdout and `logs/bot.log` share the same lines. Useful fields:
 2. Compare the current mid to that simple moving average.
 3. If the mid is at least `ENTRY_DEVIATION_BPS` below the average **and** the spread is under `MAX_SPREAD_BPS`, go **long** (buy the ask).
 4. If stretched above, go **short** (sell the bid).
-5. Take profit / stop loss are percent from the entry. Max **one** open position.
-6. After a stop, wait `COOLDOWN_AFTER_STOP_SECONDS`.
+5. Take profit / stop loss are percent from the entry. Max **one** open position. New entries are skipped if `TAKE_PROFIT_PCT` cannot cover `2 * TAKER_FEE_RATE + TP_FEE_BUFFER`.
+6. After a stop, wait `COOLDOWN_AFTER_STOP_SECONDS` (default 300). After `STOP_CIRCUIT_AFTER` consecutive stops inside `STOP_CIRCUIT_WINDOW_SECONDS`, pause entries for `STOP_CIRCUIT_PAUSE_SECONDS`.
 7. Fees are modelled as taker (`TAKER_FEE_RATE`) on both sides unless you later switch to `POST_ONLY` (live futures only; demo Place Order docs do not list `POST_ONLY`).
 
 No grid, no martingale, no copy-trading, no 400x.
@@ -149,7 +151,9 @@ No grid, no martingale, no copy-trading, no 400x.
 - Max position quantity and max notional per order (sized as **1x**; higher account leverage is ignored).
 - Max daily loss → flatten-and-halt (London calendar day).
 - Max orders per minute (default 8; WEEX futures allow 300).
-- Public WebSocket disconnect → flatten-and-halt (no silent reconnect-and-trade).
+- Take-profit must exceed round-trip taker fees plus a small buffer, or entries are skipped (the strategy cannot bypass this).
+- After a stop: `COOLDOWN_AFTER_STOP_SECONDS`, plus a consecutive-SL circuit breaker.
+- Public WebSocket stall (no usable book quote for `QUOTE_STALL_SECONDS`) or a dropped socket → log, close, reconnect the public feed. Does **not** enable live. The process must not sit forever with an open socket and zero ticks.
 - Unhandled exception → flatten-and-halt.
 - Ctrl+C / SIGTERM → cancel open orders if the API allows, flatten, stop.
 

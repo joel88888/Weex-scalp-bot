@@ -56,10 +56,6 @@ class Bot:
         if self._feed is not None and hasattr(self._feed, "stop"):
             self._feed.stop()
 
-    def _on_ws_disconnect(self) -> None:
-        self.risk.halt("public websocket disconnected")
-        self._stop.set()
-
     async def run(self) -> int:
         setup_logging(self.settings)
         self._install_signals()
@@ -101,7 +97,8 @@ class Bot:
         s = self.settings
         log.info(
             "start mode=%s symbol=%s order_symbol=%s leverage_cap=%s qty=%s "
-            "max_notional=%s tp=%s%% sl=%s%% daily_loss=%s live=%s understand=%s fixture=%s",
+            "max_notional=%s tp=%s%% sl=%s%% daily_loss=%s live=%s understand=%s "
+            "fixture=%s stall=%ss cooldown=%ss circuit=%s/%ss/%ss",
             s.mode.value,
             s.symbol,
             s.order_symbol,
@@ -114,7 +111,21 @@ class Bot:
             s.live_flag,
             s.i_understand_live,
             s.fixture_path,
+            s.quote_stall_seconds,
+            s.cooldown_after_stop_seconds,
+            s.stop_circuit_after,
+            s.stop_circuit_window_seconds,
+            s.stop_circuit_pause_seconds,
         )
+        if not s.take_profit_covers_fees():
+            log.warning(
+                "TAKE_PROFIT_PCT=%s%% cannot cover round-trip taker fees "
+                "(2*%s + buffer %s = min %.4f%%); new entries will be skipped",
+                s.take_profit_pct,
+                s.taker_fee_rate,
+                s.tp_fee_buffer,
+                s.min_take_profit_pct,
+            )
         if s.mode is Mode.DRY_RUN and not s.has_api_keys:
             log.info(
                 "no API keys; DRY_RUN will use public market data only and simulate taker fills locally"
@@ -183,8 +194,9 @@ class Bot:
             url=self.settings.public_ws_url,
             symbol=self.settings.symbol,
             user_agent=self.settings.user_agent,
-            on_disconnect=self._on_ws_disconnect,
             seed=seed,
+            stall_timeout_seconds=self.settings.quote_stall_seconds,
+            reconnect_delay_seconds=self.settings.ws_reconnect_delay_seconds,
         )
 
     def _on_quote(self, quote: Quote) -> None:
@@ -252,6 +264,8 @@ class Bot:
             self.risk.record_realized_pnl(pnl)
             if decision.signal is Signal.EXIT_SL:
                 self.risk.on_stop_hit()
+            elif decision.signal is Signal.EXIT_TP:
+                self.risk.on_take_profit()
             self.position = None
         self._log_decision(decision, fill, pnl=pnl)
         log.info(
